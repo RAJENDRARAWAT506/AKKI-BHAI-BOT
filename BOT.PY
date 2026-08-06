@@ -51,11 +51,21 @@ BOT_TOKEN:          str = os.getenv("BOT_TOKEN", "")
 SOURCE_CHAT_ID:     int = int(os.getenv("SOURCE_CHAT_ID", "0"))
 ADMIN_ID:           int = int(os.getenv("ADMIN_ID", "0"))
 
-BROADCAST_CONCURRENCY: int = 150   # max parallel broadcast workers
+# ── Broadcast tuning ──
+# FIXED: BROADCAST_CONCURRENCY was 150, way past Telegram's real global
+# throughput limit for a bot (~30 msgs/sec). That caused constant
+# RetryAfter (flood-wait) responses, which the OLD code counted against
+# a 3-attempt retry budget shared with genuine failures -- so under load,
+# users got silently dropped ("failed") after 3 flood-waits with zero
+# logging or reporting. Fixed below with a global rate limiter + a
+# retry policy that never burns attempts on flood-waits + a real report
+# back to the admin after every broadcast.
+BROADCAST_RATE_PER_SEC: float = 25.0   # stays safely under Telegram's ~30/s cap
+BROADCAST_CONCURRENCY:  int   = 25     # workers sharing the rate limiter
 APPROVAL_CONCURRENCY:  int = 50
 SEQUENCE_CONCURRENCY:  int = 15
 MAX_RETRIES_DB:        int = 3
-MAX_RETRIES_API:       int = 3
+MAX_RETRIES_API:       int = 5     # for genuine network errors only, not flood-waits
 DB_PATH:               str = "bot.db"
 API_URL:               str = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
@@ -401,6 +411,14 @@ def db_all_user_ids() -> list:
     with get_conn() as c:
         rows = c.execute("SELECT user_id FROM users").fetchall()
         return [r["user_id"] for r in rows] if rows else []
+
+@retry_db
+def db_remove_user(user_id: int) -> bool:
+    """Delete a user permanently — used when a broadcast finds they've
+    blocked the bot, so blocked/dead accounts don't keep clogging up
+    future broadcasts, stats, etc."""
+    with get_conn() as c:
+        return c.execute("DELETE FROM users WHERE user_id=?", (user_id,)).rowcount > 0
 
 # ── Roles & Admins ──
 def is_main_admin(uid): return uid == ADMIN_ID
@@ -1054,15 +1072,50 @@ async def send_sequence_to_user(bot, user_id: int):
             await _post("sendMessage", payload)
 
 # ═══════════════════════════════════════════════════════════════════
-# BROADCAST SYSTEM — SUPERFAST, NO SOURCE CHANNEL NEEDED
+# BROADCAST SYSTEM — FIXED VERSION
 # Directly copies the stored message_id/content to every user.
 # Supports ALL media types + albums + premium emoji inline buttons.
-# Fires & forgets — panel is free instantly, no blocking.
+# Fires & forgets — panel is free instantly, no blocking — but now with
+# a GLOBAL RATE LIMITER so Telegram never flood-controls us into
+# silently dropping users, and a REAL REPORT sent back to the admin
+# after every broadcast so you can see exactly what happened.
 # ═══════════════════════════════════════════════════════════════════
 
+class _RateLimiter:
+    """Global token-bucket limiter shared by every broadcast worker, so
+    total outbound send rate never exceeds Telegram's real limit no
+    matter how many workers are running concurrently."""
+    def __init__(self, rate_per_sec: float):
+        self.rate = rate_per_sec
+        self.tokens = rate_per_sec
+        self.updated = time.monotonic()
+        self.lock = asyncio.Lock()
+
+    async def acquire(self):
+        while True:
+            async with self.lock:
+                now = time.monotonic()
+                elapsed = now - self.updated
+                self.updated = now
+                self.tokens = min(self.rate, self.tokens + elapsed * self.rate)
+                if self.tokens >= 1:
+                    self.tokens -= 1
+                    return
+                wait = (1 - self.tokens) / self.rate
+            await asyncio.sleep(wait)
+
+
+_broadcast_limiter = _RateLimiter(BROADCAST_RATE_PER_SEC)
+
+
 async def _broadcast_one(bot, uid: int, from_chat_id: int, message_id: int) -> str:
-    """Send one broadcast message. Returns 'sent' | 'blocked' | 'failed'."""
-    for attempt in range(MAX_RETRIES_API):
+    """Send one broadcast message. Returns 'sent' | 'blocked' | 'failed'.
+    RetryAfter (flood-wait) is NEVER treated as a failure — we always wait
+    it out and retry the same user, so nobody gets dropped just because
+    Telegram asked us to slow down."""
+    attempt = 0
+    while True:
+        await _broadcast_limiter.acquire()
         try:
             await bot.copy_message(
                 chat_id=uid,
@@ -1071,25 +1124,34 @@ async def _broadcast_one(bot, uid: int, from_chat_id: int, message_id: int) -> s
             )
             return "sent"
         except Forbidden:
+            # User blocked the bot / deleted their account — clean them out
+            # of the DB permanently so they stop being counted in stats and
+            # stop being targeted by future broadcasts.
+            await run(db_remove_user, uid)
             return "blocked"
         except RetryAfter as e:
-            await asyncio.sleep(e.retry_after + 0.1)
+            await asyncio.sleep(e.retry_after + 0.2)
+            continue                   # doesn't burn a retry — just wait and try again
         except (NetworkError, TimedOut):
-            if attempt < MAX_RETRIES_API - 1:
-                await asyncio.sleep(0.3 * (attempt + 1))
-            else:
+            attempt += 1
+            if attempt >= MAX_RETRIES_API:
                 return "failed"
+            await asyncio.sleep(0.5 * attempt)
         except TelegramError:
             return "failed"
         except Exception:
             return "failed"
-    return "failed"
 
 
 async def _run_broadcast(bot, from_chat_id: int, message_id: int, admin_id: int):
-    """Blast a single message to every user concurrently. Silent, no callbacks."""
+    """Blast a single message to every user, rate-limited so nobody is
+    dropped. Blocked users are deleted from the DB along the way, so the
+    next stats check already reflects the real, current total. Only the
+    main superadmin gets the full sent/blocked/failed breakdown — any
+    other admin or subadmin just gets a simple 'Broadcast Done'."""
     uids = await run(db_all_user_ids)
     if not uids:
+        await send_raw_message(admin_id, f'{pe(EMOJI_THINK,"🤔")} <b>No users to broadcast to.</b>', staff_kb_raw(admin_id))
         return
 
     sem = asyncio.Semaphore(BROADCAST_CONCURRENCY)
@@ -1099,37 +1161,102 @@ async def _run_broadcast(bot, from_chat_id: int, message_id: int, admin_id: int)
             return await _broadcast_one(bot, uid, from_chat_id, message_id)
 
     tasks = [asyncio.create_task(worker(uid)) for uid in uids]
-    await asyncio.gather(*tasks, return_exceptions=True)
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    sent = sum(1 for r in results if r == "sent")
+    blocked = sum(1 for r in results if r == "blocked")
+    failed = sum(1 for r in results if r not in ("sent", "blocked"))
+    remaining_total = await run(db_total_users)   # fresh count, post-cleanup
+
+    try:
+        if is_main_admin(admin_id):
+            await send_raw_message(
+                admin_id,
+                f'{pe(EMOJI_OK,"✅")} <b>Broadcast finished.</b>\n'
+                f'{pe(EMOJI_OK,"✅")} <b>Sent:</b> <code>{sent}</code>\n'
+                f'{pe(EMOJI_SKULL2,"☠️")} <b>Blocked bot (removed):</b> <code>{blocked}</code>\n'
+                f'{pe(EMOJI_SKULL,"💀")} <b>Failed (network/other):</b> <code>{failed}</code>\n'
+                f'{pe(EMOJI_STAR1,"⭐")} <b>Total users remaining:</b> <code>{remaining_total}</code>',
+                staff_kb_raw(admin_id)
+            )
+        else:
+            await send_raw_message(
+                admin_id,
+                f'{pe(EMOJI_OK,"✅")} <b>Broadcast Done.</b>',
+                staff_kb_raw(admin_id)
+            )
+    except Exception:
+        pass
+
+
+async def _broadcast_album_one(bot, uid: int, from_chat_id: int, message_ids: list) -> str:
+    """Same rate-limited retry policy as _broadcast_one, but for a whole
+    album (list of message_ids) sent as one unit."""
+    attempt = 0
+    while True:
+        await _broadcast_limiter.acquire()
+        try:
+            await copy_album(bot, uid, from_chat_id, message_ids)
+            return "sent"
+        except Forbidden:
+            # Same cleanup as the single-message path — delete the blocked
+            # user from the DB right away so stats stay accurate.
+            await run(db_remove_user, uid)
+            return "blocked"
+        except RetryAfter as e:
+            await asyncio.sleep(e.retry_after + 0.2)
+            continue
+        except (NetworkError, TimedOut):
+            attempt += 1
+            if attempt >= MAX_RETRIES_API:
+                return "failed"
+            await asyncio.sleep(0.5 * attempt)
+        except Exception:
+            return "failed"
 
 
 async def _run_broadcast_album(bot, from_chat_id: int, message_ids: list, admin_id: int):
-    """Blast an album (several photos/videos as one unit) to every user."""
+    """Blast an album (several photos/videos as one unit) to every user,
+    rate-limited, cleaning out blocked users, and reporting only the full
+    breakdown to the main superadmin — others get a simple 'Broadcast Done'."""
     uids = await run(db_all_user_ids)
     if not uids:
+        await send_raw_message(admin_id, f'{pe(EMOJI_THINK,"🤔")} <b>No users to broadcast to.</b>', staff_kb_raw(admin_id))
         return
 
     sem = asyncio.Semaphore(BROADCAST_CONCURRENCY)
 
     async def worker(uid):
         async with sem:
-            for attempt in range(MAX_RETRIES_API):
-                try:
-                    await copy_album(bot, uid, from_chat_id, message_ids)
-                    return
-                except Forbidden:
-                    return
-                except RetryAfter as e:
-                    await asyncio.sleep(e.retry_after + 0.1)
-                except (NetworkError, TimedOut):
-                    if attempt < MAX_RETRIES_API - 1:
-                        await asyncio.sleep(0.3 * (attempt + 1))
-                    else:
-                        return
-                except Exception:
-                    return
+            return await _broadcast_album_one(bot, uid, from_chat_id, message_ids)
 
     tasks = [asyncio.create_task(worker(uid)) for uid in uids]
-    await asyncio.gather(*tasks, return_exceptions=True)
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    sent = sum(1 for r in results if r == "sent")
+    blocked = sum(1 for r in results if r == "blocked")
+    failed = sum(1 for r in results if r not in ("sent", "blocked"))
+    remaining_total = await run(db_total_users)   # fresh count, post-cleanup
+
+    try:
+        if is_main_admin(admin_id):
+            await send_raw_message(
+                admin_id,
+                f'{pe(EMOJI_OK,"✅")} <b>Album broadcast finished.</b>\n'
+                f'{pe(EMOJI_OK,"✅")} <b>Sent:</b> <code>{sent}</code>\n'
+                f'{pe(EMOJI_SKULL2,"☠️")} <b>Blocked bot (removed):</b> <code>{blocked}</code>\n'
+                f'{pe(EMOJI_SKULL,"💀")} <b>Failed (network/other):</b> <code>{failed}</code>\n'
+                f'{pe(EMOJI_STAR1,"⭐")} <b>Total users remaining:</b> <code>{remaining_total}</code>',
+                staff_kb_raw(admin_id)
+            )
+        else:
+            await send_raw_message(
+                admin_id,
+                f'{pe(EMOJI_OK,"✅")} <b>Broadcast Done.</b>',
+                staff_kb_raw(admin_id)
+            )
+    except Exception:
+        pass
 
 
 async def _run_approve_all(bot, admin_id: int):
