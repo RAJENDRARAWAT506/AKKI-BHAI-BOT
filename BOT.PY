@@ -49,23 +49,14 @@ load_dotenv()
 
 BOT_TOKEN:          str = os.getenv("BOT_TOKEN", "")
 SOURCE_CHAT_ID:     int = int(os.getenv("SOURCE_CHAT_ID", "0"))
+CHANNEL_ID:         int = int(os.getenv("CHANNEL_ID", "0"))
 ADMIN_ID:           int = int(os.getenv("ADMIN_ID", "0"))
 
-# ── Broadcast tuning ──
-# FIXED: BROADCAST_CONCURRENCY was 150, way past Telegram's real global
-# throughput limit for a bot (~30 msgs/sec). That caused constant
-# RetryAfter (flood-wait) responses, which the OLD code counted against
-# a 3-attempt retry budget shared with genuine failures -- so under load,
-# users got silently dropped ("failed") after 3 flood-waits with zero
-# logging or reporting. Fixed below with a global rate limiter + a
-# retry policy that never burns attempts on flood-waits + a real report
-# back to the admin after every broadcast.
-BROADCAST_RATE_PER_SEC: float = 25.0   # stays safely under Telegram's ~30/s cap
-BROADCAST_CONCURRENCY:  int   = 25     # workers sharing the rate limiter
+BROADCAST_CONCURRENCY: int = 150   # max parallel broadcast workers
 APPROVAL_CONCURRENCY:  int = 50
 SEQUENCE_CONCURRENCY:  int = 15
 MAX_RETRIES_DB:        int = 3
-MAX_RETRIES_API:       int = 5     # for genuine network errors only, not flood-waits
+MAX_RETRIES_API:       int = 3
 DB_PATH:               str = "bot.db"
 API_URL:               str = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
@@ -78,16 +69,16 @@ ALBUM_DEBOUNCE: float = 1.3
 # PREMIUM EMOJI IDs
 # ═══════════════════════════════════════════════════════════════════
 # --- Original panel emojis ---
-EMOJI_BROADCAST    = "5325524851631334621"
-EMOJI_STATS        = "6165982511882047164"
-EMOJI_ADMINS       = "6170133383025267499"
-EMOJI_SUBADMINS    = "6163314886219665690"
-EMOJI_SEQUENCE     = "6204216787492409275"
-EMOJI_APPROVE      = "6169969289504756963"
-EMOJI_AUTO_APPROVE = "6163177640539721557"
-EMOJI_PERMISSIONS  = "6163403572999361145"
-EMOJI_BOT_PROFILE  = "6165628911519535262"
-EMOJI_TEST_SEQ     = "6235394337346165182"
+EMOJI_BROADCAST    = "5931313689331241517"
+EMOJI_STATS        = "5931583486291873493"
+EMOJI_ADMINS       = "5931657428448842120"
+EMOJI_SUBADMINS    = "5931303321280188466"
+EMOJI_SEQUENCE     = "5931747300639510638"
+EMOJI_APPROVE      = "5931619009966379290"
+EMOJI_AUTO_APPROVE = "5931477774261817927"
+EMOJI_PERMISSIONS  = "5931697573508158351"
+EMOJI_BOT_PROFILE  = "5965320840949011222"
+EMOJI_TEST_SEQ     = "6120648298849112199"
 EMOJI_PREMIUM      = "6291764155313558218"
 EMOJI_INTRO        = "6311999627440691097"
 EMOJI_ADD_MSG      = "5397916757333654639"
@@ -173,6 +164,7 @@ EMOJI_ZEBRA        = "5416049108529987626"   # 🦓
 EMOJI_LEAVE        = EMOJI_BAT        # 🦇 used for "Leave Message"
 EMOJI_PIN          = EMOJI_LIGHTNING4 # ⚡️ used for "Pin toggle"
 EMOJI_INBOX        = EMOJI_REPLY_SET  # 💬 used for the user→admin inbox notice
+EMOJI_CHANNEL      = EMOJI_YIN        # ☯️ used for the "Tracked Channel" setting
 
 def btn(text, style=None, emoji_id=None):
     """Build a raw reply keyboard button dict."""
@@ -331,7 +323,13 @@ def init_db() -> None:
             );
             CREATE TABLE IF NOT EXISTS leave_message (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
-                message_text TEXT
+                message_text TEXT,
+                buttons_json TEXT DEFAULT '[]'
+            );
+            CREATE TABLE IF NOT EXISTS approval_message (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                message_text TEXT,
+                buttons_json TEXT DEFAULT '[]'
             );
             CREATE TABLE IF NOT EXISTS inbox_map (
                 admin_id         INTEGER NOT NULL,
@@ -362,7 +360,13 @@ def init_db() -> None:
         except: pass
         try: c.execute("CREATE TABLE IF NOT EXISTS direct_reply (id INTEGER PRIMARY KEY CHECK (id=1), message_id INTEGER, content_json TEXT, buttons_json TEXT DEFAULT '[]')")
         except: pass
-        try: c.execute("CREATE TABLE IF NOT EXISTS leave_message (id INTEGER PRIMARY KEY CHECK (id=1), message_text TEXT)")
+        try: c.execute("CREATE TABLE IF NOT EXISTS leave_message (id INTEGER PRIMARY KEY CHECK (id=1), message_text TEXT, buttons_json TEXT DEFAULT '[]')")
+        except: pass
+        try: c.execute("ALTER TABLE leave_message ADD COLUMN buttons_json TEXT DEFAULT '[]'")
+        except: pass
+        try: c.execute("CREATE TABLE IF NOT EXISTS approval_message (id INTEGER PRIMARY KEY CHECK (id=1), message_text TEXT, buttons_json TEXT DEFAULT '[]')")
+        except: pass
+        try: c.execute("ALTER TABLE approval_message ADD COLUMN buttons_json TEXT DEFAULT '[]'")
         except: pass
         try: c.execute("CREATE TABLE IF NOT EXISTS inbox_map (admin_id INTEGER NOT NULL, admin_message_id INTEGER NOT NULL, user_id INTEGER NOT NULL, created_at TIMESTAMP DEFAULT (DATETIME('now')), PRIMARY KEY (admin_id, admin_message_id))")
         except: pass
@@ -370,6 +374,7 @@ def init_db() -> None:
         except: pass
 
         c.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('source_chat_id', ?)", (str(SOURCE_CHAT_ID),))
+        c.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('tracked_channel_id', ?)", (str(CHANNEL_ID),))
         c.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('auto_approve', '0')")
         c.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('start_enabled', '1')")
         c.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('pin_position', '')")
@@ -377,6 +382,7 @@ def init_db() -> None:
         c.execute("INSERT OR IGNORE INTO intro (id) VALUES (1)")
         c.execute("INSERT OR IGNORE INTO direct_reply (id) VALUES (1)")
         c.execute("INSERT OR IGNORE INTO leave_message (id) VALUES (1)")
+        c.execute("INSERT OR IGNORE INTO approval_message (id) VALUES (1)")
 
 # ── Users ──
 @retry_db
@@ -411,14 +417,6 @@ def db_all_user_ids() -> list:
     with get_conn() as c:
         rows = c.execute("SELECT user_id FROM users").fetchall()
         return [r["user_id"] for r in rows] if rows else []
-
-@retry_db
-def db_remove_user(user_id: int) -> bool:
-    """Delete a user permanently — used when a broadcast finds they've
-    blocked the bot, so blocked/dead accounts don't keep clogging up
-    future broadcasts, stats, etc."""
-    with get_conn() as c:
-        return c.execute("DELETE FROM users WHERE user_id=?", (user_id,)).rowcount > 0
 
 # ── Roles & Admins ──
 def is_main_admin(uid): return uid == ADMIN_ID
@@ -473,7 +471,7 @@ PERMISSIONS = [
 ]
 PERM_DISPLAY = {
     "can_broadcast":"Broadcast","can_stats":"Stats",
-    "can_manage_seq":"Manage Sequence","can_change_source":"Change Source",
+    "can_manage_seq":"Manage Sequence","can_change_source":"Change Source / Channel",
     "can_set_post_button":"Set Post Button","can_manage_subadmins":"Manage Subadmins",
     "can_manage_bot_profile":"Bot Profile","can_test_sequence":"Test Sequence",
     "can_approve_requests":"Approve All Requests","can_toggle_auto_approve":"Auto‑Approve Toggle",
@@ -524,6 +522,17 @@ def db_clear_pending_requests():
 def db_remove_pending_request(uid, chat_id):
     with get_conn() as c:
         c.execute("DELETE FROM pending_requests WHERE user_id=? AND chat_id=?", (uid, chat_id))
+@retry_db
+def db_pop_pending_request(uid, chat_id) -> bool:
+    """Delete a specific pending request and report whether it existed.
+    Used to tell a manual (outside-the-bot) approval apart from one the
+    bot itself already processed and notified."""
+    with get_conn() as c:
+        row = c.execute("SELECT 1 FROM pending_requests WHERE user_id=? AND chat_id=?", (uid, chat_id)).fetchone()
+        if not row:
+            return False
+        c.execute("DELETE FROM pending_requests WHERE user_id=? AND chat_id=?", (uid, chat_id))
+        return True
 
 # ── Intro / Direct reply ──
 @retry_db
@@ -554,12 +563,39 @@ def db_clear_direct_reply():
 @retry_db
 def db_get_leave_message():
     with get_conn() as c:
-        row = c.execute("SELECT message_text FROM leave_message WHERE id=1").fetchone()
-        return row["message_text"] if row and row["message_text"] else None
+        row = c.execute("SELECT message_text, buttons_json FROM leave_message WHERE id=1").fetchone()
+        return dict(row) if row else {}
 @retry_db
 def db_set_leave_message(text):
     with get_conn() as c:
         c.execute("UPDATE leave_message SET message_text=? WHERE id=1", (text,))
+@retry_db
+def db_set_leave_buttons(buttons_json):
+    with get_conn() as c:
+        c.execute("UPDATE leave_message SET buttons_json=? WHERE id=1", (buttons_json,))
+@retry_db
+def db_clear_leave_message():
+    with get_conn() as c:
+        c.execute("UPDATE leave_message SET message_text=NULL, buttons_json='[]' WHERE id=1")
+
+# ── Approval message ──
+@retry_db
+def db_get_approval_message():
+    with get_conn() as c:
+        row = c.execute("SELECT message_text, buttons_json FROM approval_message WHERE id=1").fetchone()
+        return dict(row) if row else {}
+@retry_db
+def db_set_approval_message(text):
+    with get_conn() as c:
+        c.execute("UPDATE approval_message SET message_text=? WHERE id=1", (text,))
+@retry_db
+def db_set_approval_buttons(buttons_json):
+    with get_conn() as c:
+        c.execute("UPDATE approval_message SET buttons_json=? WHERE id=1", (buttons_json,))
+@retry_db
+def db_clear_approval_message():
+    with get_conn() as c:
+        c.execute("UPDATE approval_message SET message_text=NULL, buttons_json='[]' WHERE id=1")
 
 # ── Inbox map (user → admin swipe-reply routing) ──
 @retry_db
@@ -639,7 +675,7 @@ def db_get_message_by_id(message_id):
         row = c.execute("SELECT * FROM messages WHERE message_id=?", (message_id,)).fetchone()
         return dict(row) if row else None
 
-# ── Source / Config ──
+# ── Source chat / Tracked channel / Config ──
 @retry_db
 def db_get_source_chat_id():
     with get_conn() as c:
@@ -649,6 +685,26 @@ def db_get_source_chat_id():
 def db_set_source_chat_id(chat_id):
     with get_conn() as c:
         c.execute("UPDATE config SET value=? WHERE key='source_chat_id'", (str(chat_id),))
+
+@retry_db
+def db_get_channel_id():
+    """The real public channel/group we track for live stats and whose
+    join/leave events drive the sequence + leave message. Distinct from
+    the source chat, which is just internal storage for message content."""
+    with get_conn() as c:
+        row = c.execute("SELECT value FROM config WHERE key='tracked_channel_id'").fetchone()
+        if row and row["value"]:
+            try: return int(row["value"])
+            except: return CHANNEL_ID
+        return CHANNEL_ID
+@retry_db
+def db_set_channel_id(chat_id):
+    with get_conn() as c:
+        c.execute(
+            "INSERT INTO config (key, value) VALUES ('tracked_channel_id', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (str(chat_id),)
+        )
 
 # ── Post‑sequence custom message ──
 @retry_db
@@ -829,8 +885,9 @@ def admin_panel_kb_raw():
         [btn(auto_text, style="primary" if auto else "danger", emoji_id=EMOJI_AUTO_APPROVE)],
         [btn("Subadmin Permissions", style="primary", emoji_id=EMOJI_PERMISSIONS),
          btn("Bot Profile", style="primary", emoji_id=EMOJI_BOT_PROFILE)],
-        [btn("Test Sequence", style="success", emoji_id=EMOJI_TEST_SEQ),
-         btn("Premium", style="primary", emoji_id=EMOJI_PREMIUM)]
+        [btn("Tracked Channel", style="primary", emoji_id=EMOJI_CHANNEL),
+         btn("Test Sequence", style="success", emoji_id=EMOJI_TEST_SEQ)],
+        [btn("Premium", style="primary", emoji_id=EMOJI_PREMIUM)]
     ])
 
 def subadmin_panel_kb_raw(uid):
@@ -862,6 +919,10 @@ def subadmin_panel_kb_raw(uid):
         auto_text = f"Auto‑Approve: {'ON' if auto else 'OFF'}"
         row.append(btn(auto_text, style="primary" if auto else "default", emoji_id=EMOJI_AUTO_APPROVE))
     if row: rows.append(row)
+    row = []
+    if perms.get("can_change_source"):
+        row.append(btn("Tracked Channel", style="primary", emoji_id=EMOJI_CHANNEL))
+    if row: rows.append(row)
     rows.append([btn("Premium", style="primary", emoji_id=EMOJI_PREMIUM)])
     if not rows:
         rows.append([btn("No permissions")])
@@ -871,7 +932,10 @@ def sequence_panel_kb_raw():
     intro_set = "Set Intro Msg" if not db_get_intro() else "Update Intro Msg"
     reply = db_get_direct_reply()
     reply_set = "Set Reply Msg" if not reply.get("message_id") else "Update Reply Msg"
-    leave_set = "Set Leave Msg" if not db_get_leave_message() else "Update Leave Msg"
+    leave = db_get_leave_message()
+    leave_set = "Set Leave Msg" if not leave.get("message_text") else "Update Leave Msg"
+    approval = db_get_approval_message()
+    approval_set = "Set Approval Msg" if not approval.get("message_text") else "Update Approval Msg"
     pin_pos = db_get_pin_position()
     pin_label = "Toggle Pin Msg: OFF" if pin_pos is None else f"Toggle Pin Msg: Pos {pin_pos}"
     return build_reply_keyboard_raw([
@@ -883,7 +947,10 @@ def sequence_panel_kb_raw():
         [btn(reply_set, style="primary", emoji_id=EMOJI_REPLY_SET),
          btn("Remove Reply Msg", style="danger", emoji_id=EMOJI_REPLY_REMOVE)],
         [btn(leave_set, style="primary", emoji_id=EMOJI_LEAVE),
-         btn(pin_label, style="success" if pin_pos is not None else "primary", emoji_id=EMOJI_PIN)],
+         btn("Remove Leave Msg", style="danger", emoji_id=EMOJI_REPLY_REMOVE)],
+        [btn(approval_set, style="primary", emoji_id=EMOJI_APPROVE),
+         btn("Remove Approval Msg", style="danger", emoji_id=EMOJI_REPLY_REMOVE)],
+        [btn(pin_label, style="success" if pin_pos is not None else "primary", emoji_id=EMOJI_PIN)],
         [btn("Back to Panel", style="danger", emoji_id=EMOJI_BACK),
          btn("Premium", style="primary", emoji_id=EMOJI_PREMIUM)]
     ])
@@ -983,17 +1050,31 @@ def buffer_album_part(key: str, msg, finalize_coro_factory):
 # APPROVAL NOTIFICATION
 # ═══════════════════════════════════════════════════════════════════
 async def notify_user_approved(bot, user_id: int):
-    row = await run(db_get_user, user_id)
-    first_name = html_escape(row["first_name"]) if row and row.get("first_name") else "dost"
-    text = (
-        f'{pe(EMOJI_OK,"✅")} Hlo <b>{first_name}</b>, '
-        f'aapki request <b>successfully approve</b> kr di gayi hai! '
-        f'{pe(EMOJI_FIREWORK,"🎇")}'
-    )
     try:
-        await bot.send_message(chat_id=user_id, text=text, parse_mode="HTML")
+        user = await bot.get_chat(user_id)
     except Exception:
-        pass
+        user = None
+
+    approval = await run(db_get_approval_message)
+    custom_text = approval.get("message_text")
+
+    if custom_text:
+        safe_text = escape_placeholders_and_html(custom_text, user) if user else custom_text
+        keyboard = _build_inline_keyboard(approval.get("buttons_json", "[]"))
+    else:
+        row = await run(db_get_user, user_id)
+        first_name = html_escape(row["first_name"]) if row and row.get("first_name") else "dost"
+        safe_text = (
+            f'{pe(EMOJI_OK,"✅")} Hlo <b>{first_name}</b>, '
+            f'aapki request <b>successfully approve</b> kr di gayi hai! '
+            f'{pe(EMOJI_FIREWORK,"🎇")}'
+        )
+        keyboard = None
+
+    payload = {"chat_id": user_id, "text": safe_text, "parse_mode": "HTML"}
+    if keyboard:
+        payload["reply_markup"] = keyboard
+    await _post("sendMessage", payload)
 
 # ═══════════════════════════════════════════════════════════════════
 # SEQUENCE DELIVERY
@@ -1072,50 +1153,15 @@ async def send_sequence_to_user(bot, user_id: int):
             await _post("sendMessage", payload)
 
 # ═══════════════════════════════════════════════════════════════════
-# BROADCAST SYSTEM — FIXED VERSION
+# BROADCAST SYSTEM — SUPERFAST, NO SOURCE CHANNEL NEEDED
 # Directly copies the stored message_id/content to every user.
 # Supports ALL media types + albums + premium emoji inline buttons.
-# Fires & forgets — panel is free instantly, no blocking — but now with
-# a GLOBAL RATE LIMITER so Telegram never flood-controls us into
-# silently dropping users, and a REAL REPORT sent back to the admin
-# after every broadcast so you can see exactly what happened.
+# Fires & forgets — panel is free instantly, no blocking.
 # ═══════════════════════════════════════════════════════════════════
 
-class _RateLimiter:
-    """Global token-bucket limiter shared by every broadcast worker, so
-    total outbound send rate never exceeds Telegram's real limit no
-    matter how many workers are running concurrently."""
-    def __init__(self, rate_per_sec: float):
-        self.rate = rate_per_sec
-        self.tokens = rate_per_sec
-        self.updated = time.monotonic()
-        self.lock = asyncio.Lock()
-
-    async def acquire(self):
-        while True:
-            async with self.lock:
-                now = time.monotonic()
-                elapsed = now - self.updated
-                self.updated = now
-                self.tokens = min(self.rate, self.tokens + elapsed * self.rate)
-                if self.tokens >= 1:
-                    self.tokens -= 1
-                    return
-                wait = (1 - self.tokens) / self.rate
-            await asyncio.sleep(wait)
-
-
-_broadcast_limiter = _RateLimiter(BROADCAST_RATE_PER_SEC)
-
-
 async def _broadcast_one(bot, uid: int, from_chat_id: int, message_id: int) -> str:
-    """Send one broadcast message. Returns 'sent' | 'blocked' | 'failed'.
-    RetryAfter (flood-wait) is NEVER treated as a failure — we always wait
-    it out and retry the same user, so nobody gets dropped just because
-    Telegram asked us to slow down."""
-    attempt = 0
-    while True:
-        await _broadcast_limiter.acquire()
+    """Send one broadcast message. Returns 'sent' | 'blocked' | 'failed'."""
+    for attempt in range(MAX_RETRIES_API):
         try:
             await bot.copy_message(
                 chat_id=uid,
@@ -1124,34 +1170,25 @@ async def _broadcast_one(bot, uid: int, from_chat_id: int, message_id: int) -> s
             )
             return "sent"
         except Forbidden:
-            # User blocked the bot / deleted their account — clean them out
-            # of the DB permanently so they stop being counted in stats and
-            # stop being targeted by future broadcasts.
-            await run(db_remove_user, uid)
             return "blocked"
         except RetryAfter as e:
-            await asyncio.sleep(e.retry_after + 0.2)
-            continue                   # doesn't burn a retry — just wait and try again
+            await asyncio.sleep(e.retry_after + 0.1)
         except (NetworkError, TimedOut):
-            attempt += 1
-            if attempt >= MAX_RETRIES_API:
+            if attempt < MAX_RETRIES_API - 1:
+                await asyncio.sleep(0.3 * (attempt + 1))
+            else:
                 return "failed"
-            await asyncio.sleep(0.5 * attempt)
         except TelegramError:
             return "failed"
         except Exception:
             return "failed"
+    return "failed"
 
 
 async def _run_broadcast(bot, from_chat_id: int, message_id: int, admin_id: int):
-    """Blast a single message to every user, rate-limited so nobody is
-    dropped. Blocked users are deleted from the DB along the way, so the
-    next stats check already reflects the real, current total. Only the
-    main superadmin gets the full sent/blocked/failed breakdown — any
-    other admin or subadmin just gets a simple 'Broadcast Done'."""
+    """Blast a single message to every user concurrently. Silent, no callbacks."""
     uids = await run(db_all_user_ids)
     if not uids:
-        await send_raw_message(admin_id, f'{pe(EMOJI_THINK,"🤔")} <b>No users to broadcast to.</b>', staff_kb_raw(admin_id))
         return
 
     sem = asyncio.Semaphore(BROADCAST_CONCURRENCY)
@@ -1161,102 +1198,37 @@ async def _run_broadcast(bot, from_chat_id: int, message_id: int, admin_id: int)
             return await _broadcast_one(bot, uid, from_chat_id, message_id)
 
     tasks = [asyncio.create_task(worker(uid)) for uid in uids]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-
-    sent = sum(1 for r in results if r == "sent")
-    blocked = sum(1 for r in results if r == "blocked")
-    failed = sum(1 for r in results if r not in ("sent", "blocked"))
-    remaining_total = await run(db_total_users)   # fresh count, post-cleanup
-
-    try:
-        if is_main_admin(admin_id):
-            await send_raw_message(
-                admin_id,
-                f'{pe(EMOJI_OK,"✅")} <b>Broadcast finished.</b>\n'
-                f'{pe(EMOJI_OK,"✅")} <b>Sent:</b> <code>{sent}</code>\n'
-                f'{pe(EMOJI_SKULL2,"☠️")} <b>Blocked bot (removed):</b> <code>{blocked}</code>\n'
-                f'{pe(EMOJI_SKULL,"💀")} <b>Failed (network/other):</b> <code>{failed}</code>\n'
-                f'{pe(EMOJI_STAR1,"⭐")} <b>Total users remaining:</b> <code>{remaining_total}</code>',
-                staff_kb_raw(admin_id)
-            )
-        else:
-            await send_raw_message(
-                admin_id,
-                f'{pe(EMOJI_OK,"✅")} <b>Broadcast Done.</b>',
-                staff_kb_raw(admin_id)
-            )
-    except Exception:
-        pass
-
-
-async def _broadcast_album_one(bot, uid: int, from_chat_id: int, message_ids: list) -> str:
-    """Same rate-limited retry policy as _broadcast_one, but for a whole
-    album (list of message_ids) sent as one unit."""
-    attempt = 0
-    while True:
-        await _broadcast_limiter.acquire()
-        try:
-            await copy_album(bot, uid, from_chat_id, message_ids)
-            return "sent"
-        except Forbidden:
-            # Same cleanup as the single-message path — delete the blocked
-            # user from the DB right away so stats stay accurate.
-            await run(db_remove_user, uid)
-            return "blocked"
-        except RetryAfter as e:
-            await asyncio.sleep(e.retry_after + 0.2)
-            continue
-        except (NetworkError, TimedOut):
-            attempt += 1
-            if attempt >= MAX_RETRIES_API:
-                return "failed"
-            await asyncio.sleep(0.5 * attempt)
-        except Exception:
-            return "failed"
+    await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def _run_broadcast_album(bot, from_chat_id: int, message_ids: list, admin_id: int):
-    """Blast an album (several photos/videos as one unit) to every user,
-    rate-limited, cleaning out blocked users, and reporting only the full
-    breakdown to the main superadmin — others get a simple 'Broadcast Done'."""
+    """Blast an album (several photos/videos as one unit) to every user."""
     uids = await run(db_all_user_ids)
     if not uids:
-        await send_raw_message(admin_id, f'{pe(EMOJI_THINK,"🤔")} <b>No users to broadcast to.</b>', staff_kb_raw(admin_id))
         return
 
     sem = asyncio.Semaphore(BROADCAST_CONCURRENCY)
 
     async def worker(uid):
         async with sem:
-            return await _broadcast_album_one(bot, uid, from_chat_id, message_ids)
+            for attempt in range(MAX_RETRIES_API):
+                try:
+                    await copy_album(bot, uid, from_chat_id, message_ids)
+                    return
+                except Forbidden:
+                    return
+                except RetryAfter as e:
+                    await asyncio.sleep(e.retry_after + 0.1)
+                except (NetworkError, TimedOut):
+                    if attempt < MAX_RETRIES_API - 1:
+                        await asyncio.sleep(0.3 * (attempt + 1))
+                    else:
+                        return
+                except Exception:
+                    return
 
     tasks = [asyncio.create_task(worker(uid)) for uid in uids]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-
-    sent = sum(1 for r in results if r == "sent")
-    blocked = sum(1 for r in results if r == "blocked")
-    failed = sum(1 for r in results if r not in ("sent", "blocked"))
-    remaining_total = await run(db_total_users)   # fresh count, post-cleanup
-
-    try:
-        if is_main_admin(admin_id):
-            await send_raw_message(
-                admin_id,
-                f'{pe(EMOJI_OK,"✅")} <b>Album broadcast finished.</b>\n'
-                f'{pe(EMOJI_OK,"✅")} <b>Sent:</b> <code>{sent}</code>\n'
-                f'{pe(EMOJI_SKULL2,"☠️")} <b>Blocked bot (removed):</b> <code>{blocked}</code>\n'
-                f'{pe(EMOJI_SKULL,"💀")} <b>Failed (network/other):</b> <code>{failed}</code>\n'
-                f'{pe(EMOJI_STAR1,"⭐")} <b>Total users remaining:</b> <code>{remaining_total}</code>',
-                staff_kb_raw(admin_id)
-            )
-        else:
-            await send_raw_message(
-                admin_id,
-                f'{pe(EMOJI_OK,"✅")} <b>Broadcast Done.</b>',
-                staff_kb_raw(admin_id)
-            )
-    except Exception:
-        pass
+    await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def _run_approve_all(bot, admin_id: int):
@@ -1317,7 +1289,16 @@ async def on_join_request(update, context):
     user = jr.from_user
     if not user: return
     await run(db_upsert_user, user.id, user.username, user.first_name, user.last_name)
-    asyncio.create_task(send_sequence_to_user(context.bot, user.id))
+
+    # Only fire the welcome sequence for the real, tracked channel — not
+    # for every random chat that happens to have join requests enabled.
+    # If no channel is configured yet (CHANNEL_ID=0), fall back to the old
+    # "any chat" behaviour so nothing breaks for existing setups.
+    channel_id = await run(db_get_channel_id)
+    is_tracked_channel = (not channel_id) or (jr.chat.id == channel_id)
+    if is_tracked_channel:
+        asyncio.create_task(send_sequence_to_user(context.bot, user.id))
+
     if await run(db_get_auto_approve):
         try:
             await context.bot.approve_chat_join_request(chat_id=jr.chat.id, user_id=user.id)
@@ -1339,11 +1320,24 @@ async def cmd_stats(update, context):
     seq_count = len(await run(db_get_messages))
     admins_count = len(await run(db_list_admins, "admin"))
     subadmins_count = len(await run(db_list_admins, "subadmin"))
+    channel_id = await run(db_get_channel_id)
+    channel_members = None
+    if channel_id:
+        try:
+            channel_members = await context.bot.get_chat_member_count(channel_id)
+        except Exception:
+            channel_members = None
+    channel_line = (
+        f'{pe(EMOJI_CHANNEL,"☯️")} <b>Live channel members:</b> <code>{channel_members}</code>\n'
+        if channel_members is not None else
+        f'{pe(EMOJI_CHANNEL,"☯️")} <b>Live channel members:</b> <code>N/A (no channel set or bot not admin there)</code>\n'
+    )
     await send_raw_message(user.id,
         f'{pe(EMOJI_CHART,"📊")} <b>Bot Statistics</b> <i>(live, straight from the DB)</i>\n'
         f'━━━━━━━━━━━━━━━━━━━━━\n'
         f'{pe(EMOJI_STAR1,"⭐")} <b>Total users:</b> <code>{total}</code>\n'
         f'{pe(EMOJI_FIREWORK,"🎇")} <b>New today:</b> <code>{daily}</code>\n'
+        f'{channel_line}'
         f'{pe(EMOJI_SIREN,"🚨")} <b>Pending approvals:</b> <code>{pending}</code>\n'
         f'{pe(EMOJI_REPEAT,"🔂")} <b>Auto‑approve:</b> <code>{auto}</code>\n'
         f'{pe(EMOJI_SEQUENCE,"📨")} <b>Sequence messages:</b> <code>{seq_count}</code>\n'
@@ -1387,8 +1381,10 @@ async def _open_bot_profile_panel(update, uid, note=""):
 
 # ═══════════════════════════════════════════════════════════════════
 # USER → ADMIN INBOX ("swipe-reply")
-# Every message a normal user sends is copied to the main admin and to
-# any subadmin with can_reply_users ON. Whoever RE-replies (native
+# Every message a normal user sends to the bot is COPIED PRIVATELY to
+# the main admin (and any subadmin with can_reply_users ON) — nowhere
+# else. It is never posted, forwarded, or shared into the tracked
+# channel, the source chat, or any group. Whoever RE-replies (native
 # Telegram reply, i.e. the classic left-swipe) to that copy has their
 # reply routed back to that exact user only.
 # ═══════════════════════════════════════════════════════════════════
@@ -1411,6 +1407,28 @@ async def _forward_to_admins_for_reply(bot, user, msg):
 # MAIN MESSAGE HANDLER
 # ═══════════════════════════════════════════════════════════════════
 
+async def _finish_button_flow(update, uid, state, note_prefix=""):
+    """Shared finalizer for the button-collection sub-flow. `state["target"]`
+    tells us whether we were attaching buttons to a sequence message
+    ("message", default) or to the Leave Message ("leave")."""
+    btns_json = json.dumps(state.get("buttons", []))
+    target = state.get("target", "message")
+    count = len(state.get("buttons", []))
+    await run(db_clear_state, uid)
+
+    if target == "leave":
+        await run(db_set_leave_buttons, btns_json)
+        await _open_sequence_panel(update, uid, f'{note_prefix}{pe(EMOJI_OK,"✅")} <b>Leave message saved with</b> <code>{count}</code> <b>button(s).</b>')
+        return
+
+    if target == "approval":
+        await run(db_set_approval_buttons, btns_json)
+        await _open_sequence_panel(update, uid, f'{note_prefix}{pe(EMOJI_OK,"✅")} <b>Approval message saved with</b> <code>{count}</code> <b>button(s).</b>')
+        return
+
+    await run(db_update_message_buttons, state["mid"], btns_json)
+    await open_panel(update, uid, f'{note_prefix}{pe(EMOJI_OK,"✅")} <b>Message at position</b> <code>{state["pos"]}</code> <b>saved with</b> <code>{count}</code> <b>button(s).</b>')
+
 async def on_message(update, context):
     msg = update.message
     user = update.effective_user
@@ -1423,7 +1441,7 @@ async def on_message(update, context):
         # Fire-and-forget: don't block the handler on the direct-reply copy
         # or the admin forward. The user just gets their configured
         # auto-reply (if any) and their raw message lands with the admins —
-        # no extra "you got a message" text, nothing else.
+        # privately, no header text, and never anywhere near the channel.
         async def _handle_user_message():
             reply = await run(db_get_direct_reply)
             if reply.get("message_id"):
@@ -1557,7 +1575,44 @@ async def on_message(update, context):
         if not db_has_perm(uid,"can_manage_seq"): await open_panel(update, uid, f'{pe(EMOJI_SKULL,"💀")} <b>No permission.</b>'); return
         await run(db_clear_state, uid)
         await run(db_set_leave_message, text)
-        await _open_sequence_panel(update, uid, f'{pe(EMOJI_OK,"✅")} <b>Leave message updated.</b> It will be sent to a user when they leave the channel/group.\n\n{PLACEHOLDER_HELP}'); return
+        state = {"target": "leave", "buttons": [], "current_row": 0}
+        await run(db_set_state, uid, "awaiting_addmsg_btn_text", json.dumps(state))
+        await send_raw_message(uid,
+            f'{pe(EMOJI_OK,"✅")} <b>Leave message text saved.</b>\n\n{PLACEHOLDER_HELP}\n\n'
+            f'{pe(EMOJI_LIGHTNING1,"⚡")} <b>Want to add a button</b> (e.g. a "Rejoin channel" link)?',
+            build_reply_keyboard_raw([
+                [btn("Yes", style="success", emoji_id=EMOJI_YES),
+                 btn("No", style="danger", emoji_id=EMOJI_NO)]
+            ]))
+        return
+    if action == "awaiting_confirm_remove_leave":
+        if not db_has_perm(uid,"can_manage_seq"): await open_panel(update, uid, f'{pe(EMOJI_SKULL,"💀")} <b>No permission.</b>'); return
+        await run(db_clear_state, uid)
+        if text.lower()!="yes": await _open_sequence_panel(update, uid, f'{pe(EMOJI_BACK,"↩️")} <b>Removal cancelled.</b>'); return
+        await run(db_clear_leave_message)
+        await _open_sequence_panel(update, uid, f'{pe(EMOJI_OK,"✅")} <b>Leave message removed.</b>'); return
+
+    # ── Approval message ──
+    if action == "awaiting_set_approval_msg":
+        if not db_has_perm(uid,"can_manage_seq"): await open_panel(update, uid, f'{pe(EMOJI_SKULL,"💀")} <b>No permission.</b>'); return
+        await run(db_clear_state, uid)
+        await run(db_set_approval_message, text)
+        state = {"target": "approval", "buttons": [], "current_row": 0}
+        await run(db_set_state, uid, "awaiting_addmsg_btn_text", json.dumps(state))
+        await send_raw_message(uid,
+            f'{pe(EMOJI_OK,"✅")} <b>Approval message text saved.</b>\n\n{PLACEHOLDER_HELP}\n\n'
+            f'{pe(EMOJI_LIGHTNING1,"⚡")} <b>Want to add a button</b> (e.g. a "Join Channel" link)?',
+            build_reply_keyboard_raw([
+                [btn("Yes", style="success", emoji_id=EMOJI_YES),
+                 btn("No", style="danger", emoji_id=EMOJI_NO)]
+            ]))
+        return
+    if action == "awaiting_confirm_remove_approval":
+        if not db_has_perm(uid,"can_manage_seq"): await open_panel(update, uid, f'{pe(EMOJI_SKULL,"💀")} <b>No permission.</b>'); return
+        await run(db_clear_state, uid)
+        if text.lower()!="yes": await _open_sequence_panel(update, uid, f'{pe(EMOJI_BACK,"↩️")} <b>Removal cancelled.</b>'); return
+        await run(db_clear_approval_message)
+        await _open_sequence_panel(update, uid, f'{pe(EMOJI_OK,"✅")} <b>Approval message removed. Default message will be used.</b>'); return
 
     # ── Pin position ──
     if action == "awaiting_pin_position":
@@ -1571,6 +1626,19 @@ async def on_message(update, context):
             await _open_sequence_panel(update, uid, f'{pe(EMOJI_OK,"✅")} <b>Pin enabled.</b> The message at position <code>{pos}</code> will be pinned in each user\'s chat when the sequence is delivered.')
         except ValueError:
             await _open_sequence_panel(update, uid, f'{pe(EMOJI_SKULL,"💀")} <b>Invalid position. Send a number.</b>')
+        return
+
+    # ── Tracked channel ──
+    if action == "awaiting_channel_id":
+        if not (is_main_admin(uid) or db_has_perm(uid,"can_change_source")):
+            await open_panel(update, uid, f'{pe(EMOJI_SKULL,"💀")} <b>No permission.</b>'); return
+        await run(db_clear_state, uid)
+        try:
+            cid = int(text)
+            await run(db_set_channel_id, cid)
+            await open_panel(update, uid, f'{pe(EMOJI_OK,"✅")} <b>Tracked channel updated to</b> <code>{cid}</code>.\nLive member stats and join/leave events will now be read from this chat.')
+        except ValueError:
+            await open_panel(update, uid, f'{pe(EMOJI_SKULL,"💀")} <b>Invalid channel ID.</b> Send a number like <code>-1001234567890</code>.')
         return
 
     # ── Add message: position ──
@@ -1617,7 +1685,7 @@ async def on_message(update, context):
             await open_panel(update, uid, f'{pe(EMOJI_SKULL,"💀")} <b>Could not forward to source:</b> <code>{e}</code>'); return
         content = extract_message_content(msg)
         await run(db_add_message, mid, pos, content, "[]")
-        state = {"mid":mid, "pos":pos, "buttons":[], "current_row":0}
+        state = {"target": "message", "mid":mid, "pos":pos, "buttons":[], "current_row":0}
         await run(db_set_state, uid, "awaiting_addmsg_btn_text", json.dumps(state))
         await send_raw_message(uid, f'{pe(EMOJI_LIGHTNING1,"⚡")} <b>Do you want to add a button?</b>',
             build_reply_keyboard_raw([
@@ -1626,14 +1694,12 @@ async def on_message(update, context):
             ]))
         return
 
-    # Button creation flow
+    # Button creation flow (shared by sequence messages AND the leave message)
     if action == "awaiting_addmsg_btn_text":
         state = json.loads(data)
         if text == "No":
-            btns_json = json.dumps(state.get("buttons",[]))
-            await run(db_update_message_buttons, state["mid"], btns_json)
-            await run(db_clear_state, uid)
-            await open_panel(update, uid, f'{pe(EMOJI_OK,"✅")} <b>Message at position</b> <code>{state["pos"]}</code> <b>saved with</b> <code>{len(state["buttons"])}</code> <b>button(s).</b>'); return
+            await _finish_button_flow(update, uid, state)
+            return
         if text == "Yes":
             await run(db_set_state, uid, "awaiting_addmsg_btn_text_input", json.dumps(state))
             await send_raw_message(uid, f'{pe(EMOJI_STAR3,"⭐")} <b>Send the button text:</b>', cancel_kb_raw()); return
@@ -1702,10 +1768,8 @@ async def on_message(update, context):
     if action == "awaiting_addmsg_another":
         state = json.loads(data)
         if text == "Done":
-            btns_json = json.dumps(state["buttons"])
-            await run(db_update_message_buttons, state["mid"], btns_json)
-            await run(db_clear_state, uid)
-            await open_panel(update, uid, f'{pe(EMOJI_OK,"✅")} <b>Message at position</b> <code>{state["pos"]}</code> <b>saved with</b> <code>{len(state["buttons"])}</code> <b>button(s).</b>'); return
+            await _finish_button_flow(update, uid, state)
+            return
         if text == "Add Another":
             await run(db_set_state, uid, "awaiting_addmsg_row_choice", json.dumps(state))
             await send_raw_message(uid, f'{pe(EMOJI_LIGHTNING3,"⚡")} <b>Same row or new row?</b>',
@@ -1794,10 +1858,23 @@ async def on_message(update, context):
         seq_count = len(await run(db_get_messages))
         admins_count = len(await run(db_list_admins, "admin"))
         subadmins_count = len(await run(db_list_admins, "subadmin"))
+        channel_id = await run(db_get_channel_id)
+        channel_members = None
+        if channel_id:
+            try:
+                channel_members = await context.bot.get_chat_member_count(channel_id)
+            except Exception:
+                channel_members = None
+        channel_line = (
+            f'{pe(EMOJI_CHANNEL,"☯️")} <b>Live channel members:</b> <code>{channel_members}</code>\n'
+            if channel_members is not None else
+            f'{pe(EMOJI_CHANNEL,"☯️")} <b>Live channel members:</b> <code>N/A (no channel set or bot not admin there)</code>\n'
+        )
         await send_raw_message(uid,
             f'{pe(EMOJI_CHART,"📊")} <b>Bot Statistics</b> <i>(live, straight from the DB)</i>\n━━━━━━━━━━━━━━━━━━━━━\n'
             f'{pe(EMOJI_STAR1,"⭐")} <b>Total users:</b> <code>{total}</code>\n'
             f'{pe(EMOJI_FIREWORK,"🎇")} <b>New today:</b> <code>{daily}</code>\n'
+            f'{channel_line}'
             f'{pe(EMOJI_SIREN,"🚨")} <b>Pending approvals:</b> <code>{pending}</code>\n'
             f'{pe(EMOJI_REPEAT,"🔂")} <b>Auto‑approve:</b> <code>{auto}</code>\n'
             f'{pe(EMOJI_SEQUENCE,"📨")} <b>Sequence messages:</b> <code>{seq_count}</code>\n'
@@ -1891,6 +1968,20 @@ async def on_message(update, context):
         await run(db_set_state, uid, "awaiting_bot_description")
         await send_raw_message(uid, f'{pe(EMOJI_CHANGE_DESC,"📄")} <b>Send new short description:</b>', cancel_kb_raw()); return
 
+    if text == "Tracked Channel":
+        if not (is_main_admin(uid) or db_has_perm(uid,"can_change_source")):
+            await send_raw_message(uid, f'{pe(EMOJI_SKULL,"💀")} <b>No permission.</b>', staff_kb_raw(uid)); return
+        current = await run(db_get_channel_id)
+        await run(db_set_state, uid, "awaiting_channel_id")
+        await send_raw_message(uid,
+            f'{pe(EMOJI_CHANNEL,"☯️")} <b>Current tracked channel:</b> <code>{current or "Not set"}</code>\n\n'
+            f'This is the <b>real channel/group</b> the bot tracks for live member stats, and whose join/leave '
+            f'events trigger the message sequence + leave message. It is separate from the internal source chat '
+            f'used to store your sequence messages.\n\n'
+            f'<b>Send the new channel ID</b> (e.g. <code>-1001234567890</code>). Make sure the bot is an admin there.',
+            cancel_kb_raw())
+        return
+
     if text == "Test Sequence":
         if not db_has_perm(uid,"can_test_sequence"): await send_raw_message(uid, f'{pe(EMOJI_SKULL,"💀")} <b>No permission.</b>', staff_kb_raw(uid)); return
         await send_raw_message(uid, f'{pe(EMOJI_DINO,"🦖")} <b>Sending test sequence...</b>', staff_kb_raw(uid))
@@ -1916,6 +2007,18 @@ async def on_message(update, context):
         if not db_has_perm(uid,"can_manage_seq"): await send_raw_message(uid, f'{pe(EMOJI_SKULL,"💀")} <b>No permission.</b>', staff_kb_raw(uid)); return
         await run(db_set_state, uid, "awaiting_set_leave_msg")
         await send_raw_message(uid, f'{pe(EMOJI_LEAVE,"🦇")} <b>Send the message users get when they leave the channel/group.</b>\n{PLACEHOLDER_HELP}', cancel_kb_raw()); return
+    if text == "Remove Leave Msg":
+        if not db_has_perm(uid,"can_manage_seq"): await send_raw_message(uid, f'{pe(EMOJI_SKULL,"💀")} <b>No permission.</b>', staff_kb_raw(uid)); return
+        await run(db_set_state, uid, "awaiting_confirm_remove_leave")
+        await send_raw_message(uid, f'{pe(EMOJI_SKULL2,"☠️")} <b>Type</b> <code>yes</code> <b>to confirm removal of the leave message (and its button).</b>', cancel_kb_raw()); return
+    if text in ("Set Approval Msg", "Update Approval Msg"):
+        if not db_has_perm(uid,"can_manage_seq"): await send_raw_message(uid, f'{pe(EMOJI_SKULL,"💀")} <b>No permission.</b>', staff_kb_raw(uid)); return
+        await run(db_set_state, uid, "awaiting_set_approval_msg")
+        await send_raw_message(uid, f'{pe(EMOJI_APPROVE,"✅")} <b>Send the message users get when their join request is approved.</b>\n{PLACEHOLDER_HELP}', cancel_kb_raw()); return
+    if text == "Remove Approval Msg":
+        if not db_has_perm(uid,"can_manage_seq"): await send_raw_message(uid, f'{pe(EMOJI_SKULL,"💀")} <b>No permission.</b>', staff_kb_raw(uid)); return
+        await run(db_set_state, uid, "awaiting_confirm_remove_approval")
+        await send_raw_message(uid, f'{pe(EMOJI_SKULL2,"☠️")} <b>Type</b> <code>yes</code> <b>to confirm removal of the approval message (and its button). The default message will be used instead.</b>', cancel_kb_raw()); return
     if text.startswith("Toggle Pin Msg:"):
         if not db_has_perm(uid,"can_manage_seq"): await send_raw_message(uid, f'{pe(EMOJI_SKULL,"💀")} <b>No permission.</b>', staff_kb_raw(uid)); return
         current = await run(db_get_pin_position)
@@ -2071,8 +2174,9 @@ async def perm_close_callback(update, context):
     except: pass
 
 # ═══════════════════════════════════════════════════════════════════
-# CHAT MEMBER TRACKING — detect a user leaving the source channel/group
-# and send them the configured "leave message" in DM.
+# CHAT MEMBER TRACKING — detect a user leaving the TRACKED CHANNEL
+# and send them the configured "leave message" (with its button, if
+# any) in DM.
 # ═══════════════════════════════════════════════════════════════════
 _JOINED_STATUSES = ("member", "administrator", "creator", "restricted")
 _LEFT_STATUSES   = ("left", "kicked")
@@ -2081,23 +2185,47 @@ async def on_chat_member_update(update, context):
     cmu = update.chat_member
     if not cmu:
         return
-    source = await run(db_get_source_chat_id)
-    if cmu.chat.id != source:
+    channel_id = await run(db_get_channel_id)
+    if not channel_id:
+        # Fall back to the old behaviour (source chat) if no dedicated
+        # channel has been configured yet, so nothing silently breaks.
+        channel_id = await run(db_get_source_chat_id)
+    if cmu.chat.id != channel_id:
         return
     old_status = cmu.old_chat_member.status
     new_status = cmu.new_chat_member.status
+
     if old_status in _JOINED_STATUSES and new_status in _LEFT_STATUSES:
         user = cmu.new_chat_member.user
         if not user or user.is_bot:
             return
-        leave_msg = await run(db_get_leave_message)
-        if not leave_msg:
+        leave = await run(db_get_leave_message)
+        leave_text = leave.get("message_text")
+        if not leave_text:
             return
         try:
-            safe_text = escape_placeholders_and_html(leave_msg, user)
-            await context.bot.send_message(chat_id=user.id, text=safe_text, parse_mode="HTML")
+            safe_text = escape_placeholders_and_html(leave_text, user)
+            keyboard = _build_inline_keyboard(leave.get("buttons_json", "[]"))
+            payload = {"chat_id": user.id, "text": safe_text, "parse_mode": "HTML"}
+            if keyboard:
+                payload["reply_markup"] = keyboard
+            await _post("sendMessage", payload)
         except Exception:
             pass
+        return
+
+    # Someone just became a member of the tracked channel. If they had a
+    # pending join request that the bot itself never cleared (i.e. neither
+    # "Approve All Requests" nor auto-approve processed them), they must
+    # have been approved manually inside Telegram — send the approval
+    # message now so they don't miss out on it.
+    if old_status in _LEFT_STATUSES and new_status in _JOINED_STATUSES:
+        user = cmu.new_chat_member.user
+        if not user or user.is_bot:
+            return
+        was_pending = await run(db_pop_pending_request, user.id, cmu.chat.id)
+        if was_pending:
+            asyncio.create_task(notify_user_approved(context.bot, user.id))
 
 # ═══════════════════════════════════════════════════════════════════
 # MAIN
