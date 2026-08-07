@@ -236,6 +236,7 @@ def get_conn():
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA busy_timeout=8000")
         yield conn
         conn.commit()
     except sqlite3.Error as e:
@@ -524,15 +525,16 @@ def db_remove_pending_request(uid, chat_id):
         c.execute("DELETE FROM pending_requests WHERE user_id=? AND chat_id=?", (uid, chat_id))
 @retry_db
 def db_pop_pending_request(uid, chat_id) -> bool:
-    """Delete a specific pending request and report whether it existed.
-    Used to tell a manual (outside-the-bot) approval apart from one the
-    bot itself already processed and notified."""
+    """Atomically delete a specific pending request and report whether it
+    existed. This is a single DELETE (not SELECT-then-DELETE) so that if
+    two callers race to claim the same row — e.g. the bulk 'Approve All'
+    worker and the chat_member update for that same user arriving at
+    nearly the same time — only ONE of them gets rowcount>0 and therefore
+    only ONE of them sends the approval notification. This is what
+    prevents duplicate 'approved' messages."""
     with get_conn() as c:
-        row = c.execute("SELECT 1 FROM pending_requests WHERE user_id=? AND chat_id=?", (uid, chat_id)).fetchone()
-        if not row:
-            return False
-        c.execute("DELETE FROM pending_requests WHERE user_id=? AND chat_id=?", (uid, chat_id))
-        return True
+        cur = c.execute("DELETE FROM pending_requests WHERE user_id=? AND chat_id=?", (uid, chat_id))
+        return cur.rowcount > 0
 
 # ── Intro / Direct reply ──
 @retry_db
@@ -1262,12 +1264,41 @@ async def cmd_start(update, context):
         asyncio.create_task(send_sequence_to_user(context.bot, user.id))
 
 async def _approve_one(chat_id, user_id, bot):
-    try:
-        await bot.approve_chat_join_request(chat_id=chat_id, user_id=user_id)
-        asyncio.create_task(notify_user_approved(bot, user_id))
-        return True
-    except Exception:
+    """Approve one pending join request (with retry on rate-limit/network
+    errors, same as the broadcast path), then atomically claim it before
+    notifying. The atomic claim (db_pop_pending_request) is what stops
+    duplicate approval messages: whichever code path — this one, or the
+    chat_member update the approval itself triggers — reaches the pop
+    first is the only one that gets to send the notification."""
+    approved_ok = False
+    for attempt in range(MAX_RETRIES_API):
+        try:
+            await bot.approve_chat_join_request(chat_id=chat_id, user_id=user_id)
+            approved_ok = True
+            break
+        except RetryAfter as e:
+            await asyncio.sleep(e.retry_after + 0.1)
+        except (NetworkError, TimedOut):
+            if attempt < MAX_RETRIES_API - 1:
+                await asyncio.sleep(0.3 * (attempt + 1))
+            else:
+                return False
+        except Forbidden:
+            # User/chat no longer reachable (left, blocked bot, etc.) —
+            # this row can never succeed, so drop it instead of leaving
+            # it stuck in pending forever.
+            await run(db_remove_pending_request, user_id, chat_id)
+            return False
+        except Exception:
+            return False
+
+    if not approved_ok:
         return False
+
+    won = await run(db_pop_pending_request, user_id, chat_id)
+    if won:
+        asyncio.create_task(notify_user_approved(bot, user_id))
+    return True
 
 async def approve_all_pending(bot):
     pending = await run(db_get_pending_requests)
@@ -1278,10 +1309,17 @@ async def approve_all_pending(bot):
         async with sem:
             return await _approve_one(req["chat_id"], req["user_id"], bot)
     tasks = [asyncio.create_task(worker(req)) for req in pending]
-    results = await asyncio.gather(*tasks)
-    approved = sum(results)
-    await run(db_clear_pending_requests)
-    return approved, len(pending) - approved
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    approved = sum(1 for r in results if r is True)
+    failed = len(pending) - approved
+    # NOTE: no bulk db_clear_pending_requests() here anymore. Each
+    # successful approval already removed its own row (via the atomic
+    # pop above); each permanently-failed one (Forbidden) removed itself
+    # too. Anything left behind was a transient failure (flood limit,
+    # network) and stays pending so the next "Approve All Requests" can
+    # retry it — instead of silently vanishing and never getting
+    # approved or notified.
+    return approved, failed
 
 async def on_join_request(update, context):
     jr = update.chat_join_request
