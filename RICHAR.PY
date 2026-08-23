@@ -232,7 +232,7 @@ def retry_db(func):
 def get_conn():
     conn = None
     try:
-        conn = sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES)
+        conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
@@ -919,7 +919,7 @@ def admin_panel_kb_raw():
          btn("Bot Profile", style="primary", emoji_id=EMOJI_BOT_PROFILE)],
         [btn("Tracked Channel", style="primary", emoji_id=EMOJI_CHANNEL),
          btn("Test Sequence", style="success", emoji_id=EMOJI_TEST_SEQ)],
-        [btn("DM ADMIN", style="primary", emoji_id=EMOJI_PREMIUM)]
+        [btn("MSG RICHARD CARTER", style="danger", emoji_id=EMOJI_PREMIUM)]
     ])
 
 def subadmin_panel_kb_raw(uid):
@@ -955,7 +955,7 @@ def subadmin_panel_kb_raw(uid):
     if perms.get("can_change_source"):
         row.append(btn("Tracked Channel", style="primary", emoji_id=EMOJI_CHANNEL))
     if row: rows.append(row)
-    rows.append([btn("DM ADMIN", style="primary", emoji_id=EMOJI_PREMIUM)])
+    rows.append([btn("MSG RICHARD CARTER", style="danger", emoji_id=EMOJI_PREMIUM)])
     if not rows:
         rows.append([btn("No permissions")])
     return build_reply_keyboard_raw(rows)
@@ -984,7 +984,7 @@ def sequence_panel_kb_raw():
          btn("Remove Approval Msg", style="danger", emoji_id=EMOJI_REPLY_REMOVE)],
         [btn(pin_label, style="success" if pin_pos is not None else "primary", emoji_id=EMOJI_PIN)],
         [btn("Back to Panel", style="danger", emoji_id=EMOJI_BACK),
-         btn("DM ADMIN", style="primary", emoji_id=EMOJI_PREMIUM)]
+         btn("MSG RICHARD CARTER", style="danger", emoji_id=EMOJI_PREMIUM)]
     ])
 
 def bot_profile_kb_raw():
@@ -993,7 +993,7 @@ def bot_profile_kb_raw():
          btn("Change Bio", style="primary", emoji_id=EMOJI_CHANGE_BIO)],
         [btn("Change Description", style="primary", emoji_id=EMOJI_CHANGE_DESC)],
         [btn("Back to Panel", style="success", emoji_id=EMOJI_BACK),
-         btn("DM ADMIN", style="primary", emoji_id=EMOJI_PREMIUM)]
+         btn("MSG RICHARD CARTER", style="danger", emoji_id=EMOJI_PREMIUM)]
     ])
 
 def cancel_kb_raw():
@@ -2149,7 +2149,7 @@ async def on_message(update, context):
             lines.append(f"• **{r['position']}** → msg_id `{r['message_id']}`{buttons}\n  _Preview: {preview}_")
         body = "\n".join(lines)
         await send_raw_message(uid, f'{pe(EMOJI_LIST_MSG,"📋")} <b>Sequence</b> (total {len(rows)})\n{body}', sequence_panel_kb_raw()); return
-    if text == "DM ADMIN":
+    if text == "MSG RICHARD CARTER":
         admin_username = None
         try:
             admin_chat = await context.bot.get_chat(ADMIN_ID)
@@ -2157,11 +2157,18 @@ async def on_message(update, context):
         except Exception:
             admin_username = None
         url = f"https://t.me/{admin_username}" if admin_username else f"tg://user?id={ADMIN_ID}"
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("💬 Message Admin", url=url)]])
+        btn_obj = {
+            "text": "MSG ADMIN NOW",
+            "url": url,
+            "style": "danger",
+            "row": 0,
+            "emoji_id": EMOJI_PREMIUM
+        }
+        keyboard = _build_inline_keyboard(json.dumps([btn_obj]))
         await send_raw_message(
             uid,
-            f'{pe(EMOJI_INBOX,"💬")} <b>Tap below to message the admin directly.</b>',
-            kb.to_dict()
+            f'{pe(EMOJI_PREMIUM,"💎")} <b>Tap below to message Richard Carter directly.</b>',
+            keyboard
         )
         return
 
