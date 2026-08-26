@@ -1258,9 +1258,9 @@ async def notify_user_approved(bot, user_id: int):
     # is the only real fix for "later broadcasts don't reach them".
     if _bot_username:
         start_btn_row = [{
-            "text": "🔓 Tap to unlock future updates",
+            "text": "TAP HERE TO UNLOCK FUTURE UPDATES",
             "url": f"https://t.me/{_bot_username}?start=1",
-            "style": "success",
+            "style": "danger",
             "icon_custom_emoji_id": EMOJI_UP,
         }]
         if keyboard and keyboard.get("inline_keyboard"):
@@ -1359,13 +1359,13 @@ async def send_sequence_to_user(bot, user_id: int):
             try:
                 await _post("sendMessage", {
                     "chat_id": user_id,
-                    "text": f'{pe(EMOJI_SIREN,"🚨")} <b>Miss future updates?</b> Tap below once so I can always reach you 👇',
+                    "text": f'{pe(EMOJI_SIREN,"🚨")} <b>𝑴𝒊𝒔𝒔 𝒇𝒖𝒕𝒖𝒓𝒆 𝒖𝒑𝒅𝒂𝒕𝒆𝒔?</b> 𝑻𝒂𝒑 𝒃𝒆𝒍𝒐𝒘 𝒐𝒏𝒄𝒆 𝒔𝒐 𝑰 𝒄𝒂𝒏 𝒂𝒍𝒘𝒂𝒚𝒔 𝒓𝒆𝒂𝒄𝒉 𝒚𝒐𝒖',
                     "parse_mode": "HTML",
                     "reply_markup": {"inline_keyboard": [[
                         {
-                            "text": "🔓 Tap here (takes 1 sec)",
+                            "text": "𝐓𝐚𝐩 𝐡𝐞𝐫𝐞 (𝐭𝐚𝐤𝐞𝐬 𝟏 𝐬𝐞𝐜)",
                             "url": f"https://t.me/{_bot_username}?start=1",
-                            "style": "success",
+                            "style": "danger",
                             "icon_custom_emoji_id": EMOJI_UP,
                         }
                     ]]}
