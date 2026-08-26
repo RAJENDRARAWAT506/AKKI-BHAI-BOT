@@ -477,7 +477,7 @@ def init_db() -> None:
         msg_person_url = build_msg_person_url()
         if msg_person_url:
             leave_buttons = json.dumps([{
-                "text": "🚨 MSG ADMIN NOW",
+                "text": "𝐌𝐒𝐆 𝐀𝐃𝐌𝐈𝐍 𝐍𝐎𝐖",
                 "url": msg_person_url,
                 "row": 0,
                 "style": "danger",
