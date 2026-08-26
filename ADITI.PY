@@ -52,6 +52,9 @@ BOT_TOKEN:          str = os.getenv("BOT_TOKEN", "")
 SOURCE_CHAT_ID:     int = int(os.getenv("SOURCE_CHAT_ID", "0"))
 CHANNEL_ID:         int = int(os.getenv("CHANNEL_ID", "0"))
 ADMIN_ID:           int = int(os.getenv("ADMIN_ID", "0"))
+MSG_PERSON_ID:      str = os.getenv("MSG_PERSON_ID", "")  # username OR numeric user id of the
+                                                            # person the "MSG ADMIN NOW" button
+                                                            # on the leave message opens a DM with
 
 BROADCAST_CONCURRENCY: int = 300   # max parallel broadcast workers — GLOBAL, shared by every
                                     # broadcast running at once (see broadcast_semaphore below),
@@ -436,6 +439,51 @@ def init_db() -> None:
         c.execute("INSERT OR IGNORE INTO direct_reply (id) VALUES (1)")
         c.execute("INSERT OR IGNORE INTO leave_message (id) VALUES (1)")
         c.execute("INSERT OR IGNORE INTO approval_message (id) VALUES (1)")
+
+        # ── Hardcoded default APPROVAL message text (as requested) ──
+        # Only fills it in if nothing's been set yet, so it won't stomp
+        # on anything an admin later customizes through the panel.
+        default_approval_text = (
+            '<tg-emoji emoji-id="5350444080084033572">⭐️</tg-emoji>𝐇𝐞𝐥𝐥𝐨 {first_name} '
+            '<tg-emoji emoji-id="6095851644468072524">⭐️</tg-emoji>\n'
+            '<tg-emoji emoji-id="6172256733252032272">⭐️</tg-emoji>𝐘𝐨𝐮𝐫 𝐫𝐞𝐪𝐮𝐞𝐬𝐭 𝐡𝐚𝐬 𝐛𝐞𝐞𝐧 𝐬𝐮𝐜𝐜𝐞𝐬𝐬𝐟𝐮𝐥𝐥𝐲 𝐚𝐩𝐩𝐫𝐨𝐯𝐞𝐝!   \n\n'
+            '<tg-emoji emoji-id="6197160401038217772">⭐️</tg-emoji>  𝐖𝐞𝐥𝐜𝐨𝐦𝐞 𝐭𝐨 𝐎𝐮𝐫 𝐂𝐡𝐚𝐧𝐧𝐞𝐥! '
+            '<tg-emoji emoji-id="6224390807227470978">⭐️</tg-emoji> '
+        )
+        c.execute(
+            "UPDATE approval_message SET message_text=? WHERE id=1 AND (message_text IS NULL OR message_text='')",
+            (default_approval_text,)
+        )
+
+        # ── Hardcoded default LEAVE message text + red "MSG ADMIN NOW"
+        #    button (as requested) ──
+        default_leave_text = (
+            '<tg-emoji emoji-id="6100474871819540562">⭐️</tg-emoji>𝐇𝐞𝐥𝐥𝐨 {first_name}\n\n'
+            '<tg-emoji emoji-id="6280737977832312361">⭐️</tg-emoji> 𝐀𝐚𝐩𝐧𝐞 𝐡𝐚𝐦𝐚𝐫𝐚 𝐕𝐈𝐏 𝐒𝐮𝐫𝐞𝐬𝐡𝐨𝐭 𝐂𝐡𝐚𝐧𝐧𝐞𝐥\n'
+            '𝐥𝐞𝐚𝐯𝐞 𝐤𝐚𝐫 𝐝𝐢𝐲𝐚 𝐡𝐚𝐢.\n'
+            '<tg-emoji emoji-id="5240181867184936714">⭐️</tg-emoji> <tg-emoji emoji-id="5240181867184936714">⭐️</tg-emoji>𝐍𝐢𝐜𝐡𝐞 𝐝𝐢𝐲𝐞 𝐠𝐚𝐲𝐞 𝐀𝐝𝐦𝐢𝐧 𝐔𝐬𝐞𝐫𝐧𝐚𝐦𝐞\n'
+            '𝐩𝐚𝐫 𝐃𝐌 𝐤𝐚𝐫𝐞𝐧. <tg-emoji emoji-id="6116131058405611839">⭐️</tg-emoji><tg-emoji emoji-id="6116131058405611839">⭐️</tg-emoji>\n\n'
+            '<tg-emoji emoji-id="6266936886405633043">⭐️</tg-emoji> 𝐀𝐚𝐩𝐤𝐨 𝐟𝐢𝐫 𝐬𝐞 𝐕𝐈𝐏 𝐂𝐡𝐚𝐧𝐧𝐞𝐥\n'
+            '𝐦𝐞𝐢𝐧 𝐣𝐨𝐢𝐧 𝐤𝐚𝐫 𝐝𝐢𝐲𝐚 𝐣𝐚𝐲𝐞𝐠𝐚. <tg-emoji emoji-id="6278089627983155816">⭐️</tg-emoji>'
+        )
+        c.execute(
+            "UPDATE leave_message SET message_text=? WHERE id=1 AND (message_text IS NULL OR message_text='')",
+            (default_leave_text,)
+        )
+        # The red "MSG ADMIN NOW" button is config-driven (depends on
+        # MSG_PERSON_ID in .env), so it's kept in sync on EVERY startup —
+        # unlike the text above, this always overwrites, so changing
+        # MSG_PERSON_ID in .env and restarting is enough to update it.
+        msg_person_url = build_msg_person_url()
+        if msg_person_url:
+            leave_buttons = json.dumps([{
+                "text": "🚨 MSG ADMIN NOW",
+                "url": msg_person_url,
+                "row": 0,
+                "style": "danger",
+                "emoji_id": EMOJI_SIREN,
+            }])
+            c.execute("UPDATE leave_message SET buttons_json=? WHERE id=1", (leave_buttons,))
 
 # ── Users ──
 @retry_db
@@ -827,6 +875,7 @@ def db_clear_state(uid):
 # ASYNC API HELPERS (aiohttp — non-blocking, this is the main speed fix)
 # ═══════════════════════════════════════════════════════════════════
 _http_session: "aiohttp.ClientSession | None" = None
+_bot_username: "str | None" = None  # cached at startup, used to build /start deep links
 
 async def _get_session() -> aiohttp.ClientSession:
     global _http_session
@@ -1135,6 +1184,16 @@ def escape_placeholders_and_html(text: str, user) -> str:
             .replace("{username}", username)
             .replace("{id}", uid))
 
+def build_msg_person_url() -> "str | None":
+    """Turn MSG_PERSON_ID (from .env) into a URL that opens a DM with
+    that person. Accepts either a plain @username or a numeric user id."""
+    val = (MSG_PERSON_ID or "").strip().lstrip("@")
+    if not val:
+        return None
+    if val.isdigit():
+        return f"tg://user?id={val}"
+    return f"https://t.me/{val}"
+
 # ═══════════════════════════════════════════════════════════════════
 # ALBUM BUFFERING
 # Telegram sends each item of an album (media group) as its own update.
@@ -1191,6 +1250,18 @@ async def notify_user_approved(bot, user_id: int):
             f'{pe(EMOJI_FIREWORK,"🎇")}'
         )
         keyboard = None
+
+    # IMPORTANT: Telegram only lets a bot message someone who submitted a
+    # join request for a short one-time window. Once that window closes,
+    # the bot can't message them again (broadcasts included) until they
+    # personally press /start. This button — tapping it fires /start —
+    # is the only real fix for "later broadcasts don't reach them".
+    if _bot_username:
+        start_btn_row = [{"text": "🔓 Tap to unlock future updates", "url": f"https://t.me/{_bot_username}?start=1"}]
+        if keyboard and keyboard.get("inline_keyboard"):
+            keyboard["inline_keyboard"].append(start_btn_row)
+        else:
+            keyboard = {"inline_keyboard": [start_btn_row]}
 
     payload = {"chat_id": user_id, "text": safe_text, "parse_mode": "HTML"}
     if keyboard:
@@ -1272,6 +1343,24 @@ async def send_sequence_to_user(bot, user_id: int):
             if keyboard:
                 payload["reply_markup"] = keyboard
             await _post("sendMessage", payload)
+
+        # This sequence also fires for users who arrived via a join
+        # request (not just /start). If they never actually pressed
+        # /start, Telegram will silently cut the bot off from messaging
+        # them again shortly — future broadcasts won't reach them. Ask
+        # them to tap /start now, while the chat is still open, so they
+        # stay reachable long-term.
+        if _bot_username:
+            try:
+                await _post("sendMessage", {
+                    "chat_id": user_id,
+                    "text": f'{pe(EMOJI_SIREN,"🚨")} <b>Miss future updates?</b> Tap below once so I can always reach you 👇',
+                    "reply_markup": {"inline_keyboard": [[
+                        {"text": "🔓 Tap here (takes 1 sec)", "url": f"https://t.me/{_bot_username}?start=1"}
+                    ]]}
+                })
+            except Exception:
+                pass
 
 # ═══════════════════════════════════════════════════════════════════
 # BROADCAST SYSTEM — SUPERFAST, NO SOURCE CHANNEL NEEDED
@@ -1403,8 +1492,19 @@ async def _broadcast_one(bot, uid: int, from_chat_id: int, message_id: int) -> s
         except RetryAfter as e:
             await asyncio.sleep(e.retry_after + 0.05)
             continue
-        except Forbidden:
-            # User blocked the bot / deleted account — not recoverable.
+        except Forbidden as e:
+            # Two very different situations both raise Forbidden:
+            #  1) The user actually blocked the bot / deleted their
+            #     account — permanent, safe to remove from the DB.
+            #  2) "bot can't initiate conversation with a user" — the
+            #     user joined via a request but never pressed /start, so
+            #     Telegram's temporary join-request messaging window has
+            #     closed. This is NOT permanent — the moment they /start
+            #     the bot, they're reachable again. Deleting them here
+            #     was the bug causing "only the first broadcast reaches
+            #     join-request users" — treat it as a soft miss instead.
+            if "initiate conversation" in str(e).lower():
+                return "not_started"
             return "blocked"
         except (NetworkError, TimedOut):
             if attempt == 0:
@@ -1425,7 +1525,9 @@ async def _broadcast_album_one(bot, uid: int, from_chat_id: int, message_ids: li
         except RetryAfter as e:
             await asyncio.sleep(e.retry_after + 0.05)
             continue
-        except Forbidden:
+        except Forbidden as e:
+            if "initiate conversation" in str(e).lower():
+                return "not_started"
             return "blocked"
         except (NetworkError, TimedOut):
             if attempt == 0:
@@ -2503,6 +2605,12 @@ async def _post_init(app):
     Picks up any broadcast that was cut off by a crash/restart and
     finishes sending it — this is what stops interrupted broadcasts from
     silently losing recipients."""
+    global _bot_username
+    try:
+        me = await app.bot.get_me()
+        _bot_username = me.username
+    except Exception:
+        pass
     asyncio.create_task(_resume_pending_broadcasts(app.bot))
 
 async def _on_error(update, context):
