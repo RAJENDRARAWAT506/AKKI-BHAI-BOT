@@ -1257,7 +1257,12 @@ async def notify_user_approved(bot, user_id: int):
     # personally press /start. This button — tapping it fires /start —
     # is the only real fix for "later broadcasts don't reach them".
     if _bot_username:
-        start_btn_row = [{"text": "🔓 Tap to unlock future updates", "url": f"https://t.me/{_bot_username}?start=1"}]
+        start_btn_row = [{
+            "text": "🔓 Tap to unlock future updates",
+            "url": f"https://t.me/{_bot_username}?start=1",
+            "style": "success",
+            "icon_custom_emoji_id": EMOJI_UP,
+        }]
         if keyboard and keyboard.get("inline_keyboard"):
             keyboard["inline_keyboard"].append(start_btn_row)
         else:
@@ -1355,8 +1360,14 @@ async def send_sequence_to_user(bot, user_id: int):
                 await _post("sendMessage", {
                     "chat_id": user_id,
                     "text": f'{pe(EMOJI_SIREN,"🚨")} <b>Miss future updates?</b> Tap below once so I can always reach you 👇',
+                    "parse_mode": "HTML",
                     "reply_markup": {"inline_keyboard": [[
-                        {"text": "🔓 Tap here (takes 1 sec)", "url": f"https://t.me/{_bot_username}?start=1"}
+                        {
+                            "text": "🔓 Tap here (takes 1 sec)",
+                            "url": f"https://t.me/{_bot_username}?start=1",
+                            "style": "success",
+                            "icon_custom_emoji_id": EMOJI_UP,
+                        }
                     ]]}
                 })
             except Exception:
@@ -1640,13 +1651,35 @@ async def on_join_request(update, context):
     # "any chat" behaviour so nothing breaks for existing setups.
     channel_id = await run(db_get_channel_id)
     is_tracked_channel = (not channel_id) or (jr.chat.id == channel_id)
+    seq_task = None
     if is_tracked_channel:
-        asyncio.create_task(send_sequence_to_user(context.bot, user.id))
+        seq_task = asyncio.create_task(send_sequence_to_user(context.bot, user.id))
 
     if await run(db_get_auto_approve):
         try:
+            # Register the pending row BEFORE approving, then race for it
+            # with db_pop_pending_request — the exact same atomic-claim
+            # pattern _approve_one uses for manual approvals. Approving
+            # via the API also fires a chat_member update, which tries
+            # this same pop; whichever of the two gets there first is the
+            # ONLY one that gets to send the approval message. This is
+            # what was missing here and caused the duplicate "approved"
+            # messages on auto-approve.
+            await run(db_add_pending_request, user.id, jr.chat.id)
             await context.bot.approve_chat_join_request(chat_id=jr.chat.id, user_id=user.id)
-            asyncio.create_task(notify_user_approved(context.bot, user.id))
+            won = await run(db_pop_pending_request, user.id, jr.chat.id)
+            if won:
+                async def _notify_after_sequence(bot=context.bot, uid=user.id, wait_on=seq_task):
+                    # Wait for the welcome sequence to fully finish first —
+                    # the approval message should land AFTER it, not race
+                    # ahead of / alongside it.
+                    if wait_on is not None:
+                        try:
+                            await wait_on
+                        except Exception:
+                            pass
+                    await notify_user_approved(bot, uid)
+                asyncio.create_task(_notify_after_sequence())
         except: pass
     else:
         await run(db_add_pending_request, user.id, jr.chat.id)
