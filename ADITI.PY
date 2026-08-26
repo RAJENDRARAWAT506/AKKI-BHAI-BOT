@@ -381,6 +381,16 @@ def init_db() -> None:
                 created_at       TIMESTAMP DEFAULT (DATETIME('now')),
                 PRIMARY KEY (admin_id, admin_message_id)
             );
+            CREATE TABLE IF NOT EXISTS broadcast_jobs (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind             TEXT NOT NULL,          -- 'single' or 'album'
+                from_chat_id     INTEGER NOT NULL,
+                message_id       INTEGER,                -- for kind='single'
+                message_ids_json TEXT,                   -- for kind='album'
+                remaining_json   TEXT NOT NULL,           -- JSON list of user_ids not yet attempted
+                admin_id         INTEGER,
+                created_at       TIMESTAMP DEFAULT (DATETIME('now'))
+            );
         """)
         for col in ["content_json", "buttons_json"]:
             try: c.execute(f"ALTER TABLE messages ADD COLUMN {col} TEXT DEFAULT '[]'")
@@ -470,6 +480,33 @@ def db_delete_users(user_ids: list) -> int:
     with get_conn() as c:
         c.executemany("DELETE FROM users WHERE user_id=?", [(u,) for u in user_ids])
         return len(user_ids)
+
+# ── Broadcast job persistence (crash-safe resume) ──
+@retry_db
+def db_create_broadcast_job(kind, from_chat_id, message_id, message_ids_json, uids, admin_id) -> int:
+    with get_conn() as c:
+        cur = c.execute(
+            "INSERT INTO broadcast_jobs (kind, from_chat_id, message_id, message_ids_json, remaining_json, admin_id) "
+            "VALUES (?,?,?,?,?,?)",
+            (kind, from_chat_id, message_id, message_ids_json, json.dumps(uids), admin_id)
+        )
+        return cur.lastrowid
+
+@retry_db
+def db_checkpoint_broadcast_job(job_id, uids):
+    with get_conn() as c:
+        c.execute("UPDATE broadcast_jobs SET remaining_json=? WHERE id=?", (json.dumps(uids), job_id))
+
+@retry_db
+def db_delete_broadcast_job(job_id):
+    with get_conn() as c:
+        c.execute("DELETE FROM broadcast_jobs WHERE id=?", (job_id,))
+
+@retry_db
+def db_get_incomplete_broadcast_jobs():
+    with get_conn() as c:
+        rows = c.execute("SELECT * FROM broadcast_jobs").fetchall()
+        return [dict(r) for r in rows] if rows else []
 
 # ── Roles & Admins ──
 def is_main_admin(uid): return uid == ADMIN_ID
@@ -1243,6 +1280,114 @@ async def send_sequence_to_user(bot, user_id: int):
 # Fires & forgets — panel is free instantly, no blocking.
 # ═══════════════════════════════════════════════════════════════════
 
+async def _broadcast_worker_loop(bot, job_id, from_chat_id, kind, message_id, message_ids,
+                                  queue: asyncio.Queue, blocked_ids: list):
+    """Pull user_ids off the shared queue one at a time until it's empty.
+    Any number of these can run in parallel, bounded by broadcast_semaphore,
+    and shared across every broadcast currently running."""
+    while True:
+        try:
+            uid = queue.get_nowait()
+        except asyncio.QueueEmpty:
+            return
+        async with broadcast_semaphore:
+            await broadcast_rate_limiter.wait()
+            if kind == "album":
+                result = await _broadcast_album_one(bot, uid, from_chat_id, message_ids)
+            else:
+                result = await _broadcast_one(bot, uid, from_chat_id, message_id)
+            if result == "blocked":
+                blocked_ids.append(uid)
+        queue.task_done()
+
+
+async def _checkpoint_loop(job_id, queue: asyncio.Queue, uids_pool: list, stop_event: asyncio.Event):
+    """Every couple seconds, persist whatever's still left in the queue to
+    the DB. This is what makes a broadcast crash-safe: if the bot dies or
+    restarts mid-broadcast, on next startup we reload this list and finish
+    sending to whoever didn't get it yet, instead of silently losing them."""
+    while not stop_event.is_set():
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=2.0)
+        except asyncio.TimeoutError:
+            pass
+        remaining = list(queue._queue)  # snapshot of what's left, unattempted
+        await run(db_checkpoint_broadcast_job, job_id, remaining)
+
+
+async def _execute_broadcast_job(bot, job_id, kind, from_chat_id, message_id, message_ids, uids):
+    """Core runner shared by fresh broadcasts and resumed ones. Drains
+    `uids` through the GLOBAL semaphore/rate-limiter, checkpointing
+    progress to the DB as it goes, and cleans up the job row when done."""
+    if not uids:
+        await run(db_delete_broadcast_job, job_id)
+        return
+
+    queue: asyncio.Queue = asyncio.Queue()
+    for u in uids:
+        queue.put_nowait(u)
+
+    blocked_ids: list = []
+    stop_event = asyncio.Event()
+    checkpoint_task = asyncio.create_task(_checkpoint_loop(job_id, queue, uids, stop_event))
+
+    # Cap the number of worker loops at BROADCAST_CONCURRENCY too — no
+    # point spinning up more pull-loops than the semaphore will ever let
+    # through at once.
+    n_workers = min(BROADCAST_CONCURRENCY, len(uids))
+    workers = [
+        asyncio.create_task(_broadcast_worker_loop(bot, job_id, from_chat_id, kind, message_id, message_ids, queue, blocked_ids))
+        for _ in range(n_workers)
+    ]
+    await asyncio.gather(*workers, return_exceptions=True)
+
+    stop_event.set()
+    await checkpoint_task
+
+    if blocked_ids:
+        await run(db_delete_users, blocked_ids)
+    await run(db_delete_broadcast_job, job_id)
+
+
+async def _run_broadcast(bot, from_chat_id: int, message_id: int, admin_id: int):
+    """Blast a single message to every user. Persists the job first so it
+    can survive a crash/restart and resume automatically."""
+    uids = await run(db_all_user_ids)
+    if not uids:
+        return
+    job_id = await run(db_create_broadcast_job, "single", from_chat_id, message_id, None, uids, admin_id)
+    await _execute_broadcast_job(bot, job_id, "single", from_chat_id, message_id, None, uids)
+
+
+async def _run_broadcast_album(bot, from_chat_id: int, message_ids: list, admin_id: int):
+    """Blast an album to every user. Persists the job first so it can
+    survive a crash/restart and resume automatically."""
+    uids = await run(db_all_user_ids)
+    if not uids:
+        return
+    job_id = await run(db_create_broadcast_job, "album", from_chat_id, None, json.dumps(message_ids), uids, admin_id)
+    await _execute_broadcast_job(bot, job_id, "album", from_chat_id, None, message_ids, uids)
+
+
+async def _resume_pending_broadcasts(bot):
+    """Called once on startup. Any broadcast_jobs row left over from a
+    previous run (bot crashed/restarted mid-broadcast) still has its
+    un-sent user_ids saved — pick each one back up and finish it."""
+    jobs = await run(db_get_incomplete_broadcast_jobs)
+    for job in jobs:
+        try:
+            uids = json.loads(job["remaining_json"])
+        except Exception:
+            uids = []
+        if not uids:
+            await run(db_delete_broadcast_job, job["id"])
+            continue
+        message_ids = json.loads(job["message_ids_json"]) if job.get("message_ids_json") else None
+        asyncio.create_task(_execute_broadcast_job(
+            bot, job["id"], job["kind"], job["from_chat_id"], job.get("message_id"), message_ids, uids
+        ))
+
+
 async def _broadcast_one(bot, uid: int, from_chat_id: int, message_id: int) -> str:
     """Send one broadcast message. Retries once on transient network errors
     instead of silently giving up, so a brief hiccup doesn't mean that user
@@ -1271,30 +1416,6 @@ async def _broadcast_one(bot, uid: int, from_chat_id: int, message_id: int) -> s
     return "failed"
 
 
-async def _run_broadcast(bot, from_chat_id: int, message_id: int, admin_id: int):
-    """Blast a single message to every user. Uses the GLOBAL broadcast
-    semaphore + rate limiter so this plays nicely even if other broadcasts
-    are running at the same time."""
-    uids = await run(db_all_user_ids)
-    if not uids:
-        return
-
-    blocked_ids = []
-
-    async def worker(uid):
-        async with broadcast_semaphore:
-            await broadcast_rate_limiter.wait()
-            result = await _broadcast_one(bot, uid, from_chat_id, message_id)
-            if result == "blocked":
-                blocked_ids.append(uid)
-
-    tasks = [asyncio.create_task(worker(uid)) for uid in uids]
-    await asyncio.gather(*tasks, return_exceptions=True)
-
-    if blocked_ids:
-        await run(db_delete_users, blocked_ids)
-
-
 async def _broadcast_album_one(bot, uid: int, from_chat_id: int, message_ids: list) -> str:
     """Send one broadcast album. Retries once on transient network errors."""
     for attempt in range(2):
@@ -1314,29 +1435,6 @@ async def _broadcast_album_one(bot, uid: int, from_chat_id: int, message_ids: li
         except Exception:
             return "failed"
     return "failed"
-
-
-async def _run_broadcast_album(bot, from_chat_id: int, message_ids: list, admin_id: int):
-    """Blast an album to every user, sharing the GLOBAL semaphore/rate
-    limiter with every other broadcast in flight."""
-    uids = await run(db_all_user_ids)
-    if not uids:
-        return
-
-    blocked_ids = []
-
-    async def worker(uid):
-        async with broadcast_semaphore:
-            await broadcast_rate_limiter.wait()
-            result = await _broadcast_album_one(bot, uid, from_chat_id, message_ids)
-            if result == "blocked":
-                blocked_ids.append(uid)
-
-    tasks = [asyncio.create_task(worker(uid)) for uid in uids]
-    await asyncio.gather(*tasks, return_exceptions=True)
-
-    if blocked_ids:
-        await run(db_delete_users, blocked_ids)
 
 
 async def _run_approve_all(bot, admin_id: int):
@@ -2400,6 +2498,13 @@ async def on_chat_member_update(update, context):
 async def _post_shutdown(app):
     await close_http_session()
 
+async def _post_init(app):
+    """Runs once right after the bot connects, before polling starts.
+    Picks up any broadcast that was cut off by a crash/restart and
+    finishes sending it — this is what stops interrupted broadcasts from
+    silently losing recipients."""
+    asyncio.create_task(_resume_pending_broadcasts(app.bot))
+
 async def _on_error(update, context):
     """Global error handler. PTB calls this for ANY exception raised inside
     a handler instead of letting it crash the dispatcher. We just log it —
@@ -2442,6 +2547,7 @@ def build_app():
         .request(bot_request)
         .get_updates_request(updates_request)
         .concurrent_updates(True)   # let the panel, broadcast, approvals & users run in parallel
+        .post_init(_post_init)
         .post_shutdown(_post_shutdown)
         .build()
     )
